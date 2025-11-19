@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	pebbledb "github.com/cockroachdb/pebble"
@@ -55,6 +56,48 @@ func RedisClient() *redisClient.Client {
 	return redisClient.NewClient(opts)
 }
 
+func sendLeaveNotification(ctx context.Context, api *tg.Client, notificationGroups []int64, user *tg.User, group interface{}, action string) error {
+	var userName, groupName string
+
+	// Format user info
+	if user != nil {
+		userName = user.FirstName
+		if user.LastName != "" {
+			userName += " " + user.LastName
+		}
+		if user.Username != "" {
+			userName += " (@" + user.Username + ")"
+		}
+	} else {
+		userName = "Unknown User"
+	}
+
+	// Format group info
+	switch g := group.(type) {
+	case *tg.Channel:
+		groupName = g.Title
+	case *tg.Chat:
+		groupName = g.Title
+	default:
+		groupName = "Unknown Group"
+	}
+
+	message := fmt.Sprintf("🚪 User %s %s from group \"%s\"", userName, action, groupName)
+
+	// Send notification to all notification groups
+	for _, notifGroupID := range notificationGroups {
+		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:    &tg.InputPeerChannel{ChannelID: notifGroupID},
+			Message: message,
+		})
+		if err != nil {
+			return errors.Wrap(err, "send notification")
+		}
+	}
+
+	return nil
+}
+
 func run(ctx context.Context) error {
 	var arg struct {
 		FillPeerStorage bool
@@ -82,6 +125,42 @@ func run(ctx context.Context) error {
 	if appHash == "" {
 		return errors.New("no app hash")
 	}
+
+	// Load monitoring configuration
+	monitorGroupsStr := os.Getenv("MONITOR_GROUPS")
+	notificationGroupsStr := os.Getenv("NOTIFICATION_GROUPS")
+
+	if monitorGroupsStr == "" {
+		return errors.New("MONITOR_GROUPS not set")
+	}
+	if notificationGroupsStr == "" {
+		return errors.New("NOTIFICATION_GROUPS not set")
+	}
+
+	// Parse monitored groups
+	monitorGroups := make(map[int64]bool)
+	for _, idStr := range strings.Split(monitorGroupsStr, ",") {
+		idStr = strings.TrimSpace(idStr)
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "parse monitor group id: "+idStr)
+		}
+		monitorGroups[id] = true
+	}
+
+	// Parse notification groups
+	var notificationGroups []int64
+	for _, idStr := range strings.Split(notificationGroupsStr, ",") {
+		idStr = strings.TrimSpace(idStr)
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			return errors.Wrap(err, "parse notification group id: "+idStr)
+		}
+		notificationGroups = append(notificationGroups, id)
+	}
+
+	fmt.Printf("Monitoring %d groups, will notify %d groups\n",
+		len(monitorGroups), len(notificationGroups))
 
 	// Setting up session storage.
 	// This is needed to reuse session and not login every time.
@@ -172,26 +251,84 @@ func run(ctx context.Context) error {
 	_ = resolver
 
 	// Registering handler for new private messages.
-	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
-		msg, ok := u.Message.(*tg.Message)
-		if !ok {
-			return nil
+	//dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+	//	msg, ok := u.Message.(*tg.Message)
+	//	if !ok {
+	//		return nil
+	//	}
+	//	if msg.Out {
+	//		// Outgoing message.
+	//		return nil
+	//	}
+	//
+	//	// Use PeerID to find peer because *Short updates does not contain any entities, so it necessary to
+	//	// store some entities.
+	//	//
+	//	// Storage can be filled using PeerCollector (i.e. fetching all dialogs first).
+	//	p, err := storage.FindPeer(ctx, peerDB, msg.GetPeerID())
+	//	if err != nil {
+	//		return err
+	//	}
+	//
+	//	fmt.Printf("%s: %s\n", p, msg.Message)
+	//	return nil
+	//})
+
+	// Handler for channel/supergroup participant changes
+	dispatcher.OnChannelParticipant(func(ctx context.Context, e tg.Entities, u *tg.UpdateChannelParticipant) error {
+		// Check if this is a monitored group
+		channelID := u.ChannelID
+		if !monitorGroups[channelID] && !monitorGroups[-1000000000000-channelID] {
+			return nil // Not monitoring this group
 		}
-		if msg.Out {
-			// Outgoing message.
+
+		// Check if user left (kicked, left, or banned)
+		newParticipant := u.NewParticipant
+		switch _ := newParticipant.(type) {
+		case *tg.ChannelParticipantLeft:
+			// User left the channel
+			userID := u.UserID
+			user, _ := e.Users[userID]
+
+			// Get group info
+			channel, _ := e.Channels[channelID]
+
+			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "left")
+
+		case *tg.ChannelParticipantBanned:
+			// User was kicked/banned
+			userID := u.UserID
+			user, _ := e.Users[userID]
+			channel, _ := e.Channels[channelID]
+
+			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "was kicked/banned")
+		}
+
+		return nil
+	})
+
+	// Handler for regular chat participant changes
+	dispatcher.OnChatParticipant(func(ctx context.Context, e tg.Entities, u *tg.UpdateChatParticipant) error {
+		// Check if this is a monitored group
+		chatID := u.ChatID
+		if !monitorGroups[chatID] {
 			return nil
 		}
 
-		// Use PeerID to find peer because *Short updates does not contain any entities, so it necessary to
-		// store some entities.
-		//
-		// Storage can be filled using PeerCollector (i.e. fetching all dialogs first).
-		p, err := storage.FindPeer(ctx, peerDB, msg.GetPeerID())
-		if err != nil {
-			return err
+		// Check if user left
+		newParticipant := u.NewParticipant
+		switch _ := newParticipant.(type) {
+		case *tg.ChatParticipant:
+			// User left
+			if u.PrevParticipant != nil {
+				userID := u.UserID
+				user, _ := e.Users[userID]
+				chat, _ := e.Chats[chatID]
+
+				return sendLeaveNotification(ctx, api, notificationGroups, user, chat, "left")
+			}
 		}
 
-		fmt.Printf("%s: %s\n", p, msg.Message)
 		return nil
 	})
 
