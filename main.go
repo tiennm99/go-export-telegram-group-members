@@ -159,8 +159,19 @@ func run(ctx context.Context) error {
 		notificationGroups = append(notificationGroups, id)
 	}
 
-	fmt.Printf("Monitoring %d groups, will notify %d groups\n",
-		len(monitorGroups), len(notificationGroups))
+	// Debug: Show parsed groups
+	fmt.Printf("Raw MONITOR_GROUPS: '%s'\n", monitorGroupsStr)
+	fmt.Printf("Raw NOTIFICATION_GROUPS: '%s'\n", notificationGroupsStr)
+
+	fmt.Printf("Monitoring %d groups: ", len(monitorGroups))
+	for id := range monitorGroups {
+		fmt.Printf("%d ", id)
+	}
+	fmt.Printf("\nWill notify %d groups: ", len(notificationGroups))
+	for _, id := range notificationGroups {
+		fmt.Printf("%d ", id)
+	}
+	fmt.Println()
 
 	// Setting up session storage.
 	// This is needed to reuse session and not login every time.
