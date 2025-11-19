@@ -33,6 +33,9 @@ RUN adduser \
     appuser
 USER appuser
 
+WORKDIR /app
 COPY --from=build /bin/server /bin/
+
+VOLUME ["/app/session"]
 
 ENTRYPOINT [ "/bin/server" ]
