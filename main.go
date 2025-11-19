@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -289,28 +290,62 @@ func run(ctx context.Context) error {
 	dispatcher.OnChannelParticipant(func(ctx context.Context, e tg.Entities, u *tg.UpdateChannelParticipant) error {
 		// Check if this is a monitored group
 		channelID := u.ChannelID
-		if !monitorGroups[channelID] && !monitorGroups[-1000000000000-channelID] {
+		// Telegram channel IDs in updates are positive, but in full IDs they're -100{channelID}
+		fullChannelID := -100 - channelID // Correct conversion
+
+		if !monitorGroups[channelID] && !monitorGroups[fullChannelID] {
 			return nil // Not monitoring this group
 		}
 
-		// Check if user left (kicked, left, or banned)
-		newParticipant := u.NewParticipant
-		switch newParticipant.(type) {
+		// Check if user left (NewParticipant is nil or ChannelParticipantLeft)
+		if u.NewParticipant == nil {
+			// User completely left
+			userID := u.UserID
+			user, ok := e.Users[userID]
+			if !ok {
+				// Fetch user if not in entities
+				log.Printf("User %d not found in entities", userID)
+				return nil
+			}
+
+			channel, ok := e.Channels[channelID]
+			if !ok {
+				log.Printf("Channel %d not found in entities", channelID)
+				return nil
+			}
+
+			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "left")
+		}
+
+		// Check specific participant types
+		switch u.NewParticipant.(type) {
 		case *tg.ChannelParticipantLeft:
 			// User left the channel
 			userID := u.UserID
-			user, _ := e.Users[userID]
+			user, ok := e.Users[userID]
+			if !ok {
+				return nil
+			}
 
-			// Get group info
-			channel, _ := e.Channels[channelID]
+			channel, ok := e.Channels[channelID]
+			if !ok {
+				return nil
+			}
 
 			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "left")
 
 		case *tg.ChannelParticipantBanned:
 			// User was kicked/banned
 			userID := u.UserID
-			user, _ := e.Users[userID]
-			channel, _ := e.Channels[channelID]
+			user, ok := e.Users[userID]
+			if !ok {
+				return nil
+			}
+
+			channel, ok := e.Channels[channelID]
+			if !ok {
+				return nil
+			}
 
 			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "was kicked/banned")
 		}
@@ -326,18 +361,22 @@ func run(ctx context.Context) error {
 			return nil
 		}
 
-		// Check if user left
-		newParticipant := u.NewParticipant
-		switch newParticipant.(type) {
-		case *tg.ChatParticipant:
-			// User left
-			if u.PrevParticipant != nil {
-				userID := u.UserID
-				user, _ := e.Users[userID]
-				chat, _ := e.Chats[chatID]
-
-				return sendLeaveNotification(ctx, api, notificationGroups, user, chat, "left")
+		// User left when NewParticipant is nil
+		if u.NewParticipant == nil && u.PrevParticipant != nil {
+			userID := u.UserID
+			user, ok := e.Users[userID]
+			if !ok {
+				log.Printf("User %d not found in entities", userID)
+				return nil
 			}
+
+			chat, ok := e.Chats[chatID]
+			if !ok {
+				log.Printf("Chat %d not found in entities", chatID)
+				return nil
+			}
+
+			return sendLeaveNotification(ctx, api, notificationGroups, user, chat, "left")
 		}
 
 		return nil
