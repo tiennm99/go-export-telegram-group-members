@@ -31,7 +31,7 @@ RUN adduser \
     --no-create-home \
     --uid "${UID}" \
     appuser
-RUN mkdir -p /app && chown -R appuser:appuser /app
+RUN mkdir -p /app/session && chown -R appuser:appuser /app
 
 USER appuser
 
