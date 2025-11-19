@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +33,7 @@ import (
 	"github.com/gotd/td/examples"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/updates"
@@ -47,6 +50,14 @@ func sessionFolder(phone string) string {
 	return "phone-" + string(out)
 }
 
+func randomID() int64 {
+	n, err := rand.Int(rand.Reader, big.NewInt(9223372036854775807))
+	if err != nil {
+		return time.Now().UnixNano()
+	}
+	return n.Int64()
+}
+
 func RedisClient() *redisClient.Client {
 	url := os.Getenv("REDIS_URL")
 	opts, err := redisClient.ParseURL(url)
@@ -57,10 +68,10 @@ func RedisClient() *redisClient.Client {
 	return redisClient.NewClient(opts)
 }
 
-func sendLeaveNotification(ctx context.Context, api *tg.Client, notificationGroups []int64, user *tg.User, group interface{}, action string) error {
-	var userName, groupName string
+func sendLeaveNotification(ctx context.Context, sender *message.Sender, notificationGroups []int64, user *tg.User, group interface{}, action string) error {
 
-	// Format user info
+	// ---------- Format user ----------
+	var userName string
 	if user != nil {
 		userName = user.FirstName
 		if user.LastName != "" {
@@ -73,7 +84,8 @@ func sendLeaveNotification(ctx context.Context, api *tg.Client, notificationGrou
 		userName = "Unknown User"
 	}
 
-	// Format group info
+	// ---------- Format group ----------
+	var groupName string
 	switch g := group.(type) {
 	case *tg.Channel:
 		groupName = g.Title
@@ -83,17 +95,30 @@ func sendLeaveNotification(ctx context.Context, api *tg.Client, notificationGrou
 		groupName = "Unknown Group"
 	}
 
-	message := fmt.Sprintf("🚪 User %s %s from group \"%s\"", userName, action, groupName)
+	msg := fmt.Sprintf("🚪 User %s %s from group \"%s\"", userName, action, groupName)
+	log.Println("Attempting to send notification:", msg)
 
-	// Send notification to all notification groups
-	for _, notifGroupID := range notificationGroups {
-		_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
-			Peer:    &tg.InputPeerChannel{ChannelID: notifGroupID},
-			Message: message,
-		})
+	// ---------- Send to each notification group ----------
+	for _, rawID := range notificationGroups {
+		var pureID int64 = rawID
+		//if rawID < 0 {
+		//	if rawID <= -1000000000000 {
+		//		pureID = -rawID - 1000000000000 // supergroup/channel
+		//	} else {
+		//		pureID = -rawID // normal group
+		//	}
+		//} else {
+		//	pureID = rawID
+		//}
+		log.Printf("Processing notify target: %d", pureID)
+
+		_, err := sender.To(&tg.InputPeerChannel{ChannelID: pureID, AccessHash: randomID()}).Text(ctx, msg)
 		if err != nil {
-			return errors.Wrap(err, "send notification")
+			log.Printf("Failed to send notification to %d: %v", pureID, err)
+			return err
 		}
+
+		log.Printf("Notification sent to %d successfully", pureID)
 	}
 
 	return nil
@@ -161,18 +186,18 @@ func run(ctx context.Context) error {
 	}
 
 	// Debug: Show parsed groups
-	fmt.Printf("Raw MONITOR_GROUPS: '%s'\n", monitorGroupsStr)
-	fmt.Printf("Raw NOTIFICATION_GROUPS: '%s'\n", notificationGroupsStr)
+	log.Printf("Raw MONITOR_GROUPS: '%s'\n", monitorGroupsStr)
+	log.Printf("Raw NOTIFICATION_GROUPS: '%s'\n", notificationGroupsStr)
 
-	fmt.Printf("Monitoring %d groups: ", len(monitorGroups))
+	log.Printf("Monitoring %d groups: ", len(monitorGroups))
 	for id := range monitorGroups {
-		fmt.Printf("%d ", id)
+		log.Printf("%d ", id)
 	}
-	fmt.Printf("\nWill notify %d groups: ", len(notificationGroups))
+	log.Printf("\nWill notify %d groups: ", len(notificationGroups))
 	for _, id := range notificationGroups {
-		fmt.Printf("%d ", id)
+		log.Printf("%d ", id)
 	}
-	fmt.Println()
+	log.Println()
 
 	// Setting up session storage.
 	// This is needed to reuse session and not login every time.
@@ -260,51 +285,52 @@ func run(ctx context.Context) error {
 	//   if _, err := resolver.ResolveDomain(ctx, "tdlibchat"); err != nil {
 	//	   return errors.Wrap(err, "resolve")
 	//   }
-	_ = resolver
 
-	// Registering handler for new private messages.
+	// Create a message sender that uses the resolver (handles access hash automatically)
+	sender := message.NewSender(api).WithResolver(resolver)
+
+	// Registering handler for new private messages (to verify updates are working).
 	//dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
 	//	msg, ok := u.Message.(*tg.Message)
 	//	if !ok {
 	//		return nil
 	//	}
-	//	if msg.Out {
-	//		// Outgoing message.
-	//		return nil
-	//	}
-	//
-	//	// Use PeerID to find peer because *Short updates does not contain any entities, so it necessary to
-	//	// store some entities.
-	//	//
-	//	// Storage can be filled using PeerCollector (i.e. fetching all dialogs first).
-	//	p, err := storage.FindPeer(ctx, peerDB, msg.GetPeerID())
-	//	if err != nil {
-	//		return err
-	//	}
-	//
-	//	fmt.Printf("%s: %s\n", p, msg.Message)
+	//	log.Printf("DEBUG: Received message update from PeerID: %v", msg.GetPeerID())
 	//	return nil
 	//})
 
-	// Handler for channel/supergroup participant changes
-	dispatcher.OnChannelParticipant(func(ctx context.Context, e tg.Entities, u *tg.UpdateChannelParticipant) error {
-		// Check if this is a monitored group
-		channelID := u.ChannelID
-		// Telegram channel IDs in updates are positive, but in full IDs they're -100{channelID}
-		fullChannelID := -100 - channelID // Correct conversion
-
-		if !monitorGroups[channelID] && !monitorGroups[fullChannelID] {
-			return nil // Not monitoring this group
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		// Check if this is a service message
+		serviceMsg, ok := u.Message.(*tg.MessageService)
+		if !ok {
+			// Regular message, not a service message
+			return nil
 		}
 
-		// Check if user left (NewParticipant is nil or ChannelParticipantLeft)
-		if u.NewParticipant == nil {
-			// User completely left
-			userID := u.UserID
-			user, ok := e.Users[userID]
+		// Get channel ID from peer
+		var channelID int64
+		switch peer := serviceMsg.PeerID.(type) {
+		case *tg.PeerChannel:
+			channelID = peer.ChannelID
+		default:
+			return nil
+		}
+
+		// Check if we're monitoring this group
+		fullChannelID := -1000000000000 - channelID
+		if !monitorGroups[channelID] && !monitorGroups[fullChannelID] {
+			return nil
+		}
+
+		// Check the action type
+		switch action := serviceMsg.Action.(type) {
+		case *tg.MessageActionChatDeleteUser:
+			// User left or was removed
+			log.Printf("User %d left channel %d", action.UserID, channelID)
+
+			user, ok := e.Users[action.UserID]
 			if !ok {
-				// Fetch user if not in entities
-				log.Printf("User %d not found in entities", userID)
+				log.Printf("User %d not found in entities", action.UserID)
 				return nil
 			}
 
@@ -314,69 +340,17 @@ func run(ctx context.Context) error {
 				return nil
 			}
 
-			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "left")
-		}
+			return sendLeaveNotification(ctx, sender, notificationGroups, user, channel, "left")
 
-		// Check specific participant types
-		switch u.NewParticipant.(type) {
-		case *tg.ChannelParticipantLeft:
-			// User left the channel
-			userID := u.UserID
-			user, ok := e.Users[userID]
-			if !ok {
-				return nil
-			}
+		case *tg.MessageActionChatAddUser:
+			// User was added to the group
+			log.Printf("User(s) added to channel %d: %v", channelID, action.Users)
+			// Handle if needed
 
-			channel, ok := e.Channels[channelID]
-			if !ok {
-				return nil
-			}
-
-			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "left")
-
-		case *tg.ChannelParticipantBanned:
-			// User was kicked/banned
-			userID := u.UserID
-			user, ok := e.Users[userID]
-			if !ok {
-				return nil
-			}
-
-			channel, ok := e.Channels[channelID]
-			if !ok {
-				return nil
-			}
-
-			return sendLeaveNotification(ctx, api, notificationGroups, user, channel, "was kicked/banned")
-		}
-
-		return nil
-	})
-
-	// Handler for regular chat participant changes
-	dispatcher.OnChatParticipant(func(ctx context.Context, e tg.Entities, u *tg.UpdateChatParticipant) error {
-		// Check if this is a monitored group
-		chatID := u.ChatID
-		if !monitorGroups[chatID] {
-			return nil
-		}
-
-		// User left when NewParticipant is nil
-		if u.NewParticipant == nil && u.PrevParticipant != nil {
-			userID := u.UserID
-			user, ok := e.Users[userID]
-			if !ok {
-				log.Printf("User %d not found in entities", userID)
-				return nil
-			}
-
-			chat, ok := e.Chats[chatID]
-			if !ok {
-				log.Printf("Chat %d not found in entities", chatID)
-				return nil
-			}
-
-			return sendLeaveNotification(ctx, api, notificationGroups, user, chat, "left")
+		default:
+			// Other service actions (pinned message, changed photo, etc.)
+			log.Printf("Other service action: %T", action)
+			log.Printf("Details: %+v", action)
 		}
 
 		return nil
