@@ -284,7 +284,7 @@ func run(ctx context.Context) error {
 
 		// Check if user left (kicked, left, or banned)
 		newParticipant := u.NewParticipant
-		switch _ := newParticipant.(type) {
+		switch newParticipant.(type) {
 		case *tg.ChannelParticipantLeft:
 			// User left the channel
 			userID := u.UserID
@@ -317,7 +317,7 @@ func run(ctx context.Context) error {
 
 		// Check if user left
 		newParticipant := u.NewParticipant
-		switch _ := newParticipant.(type) {
+		switch newParticipant.(type) {
 		case *tg.ChatParticipant:
 			// User left
 			if u.PrevParticipant != nil {
