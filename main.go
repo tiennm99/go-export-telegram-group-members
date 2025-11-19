@@ -12,6 +12,7 @@ import (
 
 	pebbledb "github.com/cockroachdb/pebble"
 	"github.com/go-faster/errors"
+	redisClient "github.com/go-redis/redis/v8"
 	boltstor "github.com/gotd/contrib/bbolt"
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
@@ -24,6 +25,7 @@ import (
 	"golang.org/x/time/rate"
 	lj "gopkg.in/natefinch/lumberjack.v2"
 
+	"github.com/gotd/contrib/redis"
 	"github.com/gotd/td/examples"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
@@ -41,6 +43,16 @@ func sessionFolder(phone string) string {
 		}
 	}
 	return "phone-" + string(out)
+}
+
+func RedisClient() *redisClient.Client {
+	url := os.Getenv("REDIS_URL")
+	opts, err := redisClient.ParseURL(url)
+	if err != nil {
+		panic(err)
+	}
+
+	return redisClient.NewClient(opts)
 }
 
 func run(ctx context.Context) error {
@@ -98,10 +110,9 @@ func run(ctx context.Context) error {
 	lg := zap.New(logCore)
 	defer func() { _ = lg.Sync() }()
 
-	// So, we are storing session information in current directory, under subdirectory "session/phone_hash"
-	sessionStorage := &telegram.FileSessionStorage{
-		Path: filepath.Join(sessionDir, "session.json"),
-	}
+	redisClient := RedisClient()
+	sessionStorage := redis.NewSessionStorage(redisClient, "session:"+sessionFolder(phone))
+
 	// Peer storage, for resolve caching and short updates handling.
 	db, err := pebbledb.Open(filepath.Join(sessionDir, "peers.pebble.db"), &pebbledb.Options{})
 	if err != nil {

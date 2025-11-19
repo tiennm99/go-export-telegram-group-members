@@ -7,6 +7,7 @@ toolchain go1.24.10
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/go-faster/errors v0.7.1
+	github.com/go-redis/redis/v8 v8.11.5
 	github.com/gotd/contrib v0.21.1
 	github.com/gotd/td v0.133.0
 	github.com/gotd/td/examples v0.0.0-20251114100135-7431e3eb7462
@@ -28,6 +29,7 @@ require (
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
