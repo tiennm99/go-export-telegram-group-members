@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"flag"
 	"fmt"
 	"log"
-	"math/big"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -50,14 +48,6 @@ func sessionFolder(phone string) string {
 	return "phone-" + string(out)
 }
 
-func randomID() int64 {
-	n, err := rand.Int(rand.Reader, big.NewInt(9223372036854775807))
-	if err != nil {
-		return time.Now().UnixNano()
-	}
-	return n.Int64()
-}
-
 func RedisClient() *redisClient.Client {
 	url := os.Getenv("REDIS_URL")
 	opts, err := redisClient.ParseURL(url)
@@ -68,7 +58,7 @@ func RedisClient() *redisClient.Client {
 	return redisClient.NewClient(opts)
 }
 
-func sendLeaveNotification(ctx context.Context, sender *message.Sender, notificationGroups []int64, user *tg.User, group interface{}, action string) error {
+func sendLeaveNotification(ctx context.Context, sender *message.Sender, notificationGroups []int64, notificationChannels map[int64]*tg.Channel, user *tg.User, group interface{}, action string) error {
 
 	// ---------- Format user ----------
 	var userName string
@@ -95,30 +85,60 @@ func sendLeaveNotification(ctx context.Context, sender *message.Sender, notifica
 		groupName = "Unknown Group"
 	}
 
-	msg := fmt.Sprintf("🚪 User %s %s from group \"%s\"", userName, action, groupName)
+	// Format timestamp
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	msg := fmt.Sprintf("🚪 User %s %s from group \"%s\"\n⏰ Time: %s", userName, action, groupName, timestamp)
 	log.Println("Attempting to send notification:", msg)
 
-	// ---------- Send to each notification group ----------
-	for _, rawID := range notificationGroups {
-		var pureID int64 = rawID
-		//if rawID < 0 {
-		//	if rawID <= -1000000000000 {
-		//		pureID = -rawID - 1000000000000 // supergroup/channel
-		//	} else {
-		//		pureID = -rawID // normal group
-		//	}
-		//} else {
-		//	pureID = rawID
-		//}
-		log.Printf("Processing notify target: %d", pureID)
+	// Debug: Print all available channel IDs in entities
+	log.Printf("DEBUG: Available channels in entities map:")
+	for id, ch := range notificationChannels {
+		log.Printf("  Channel ID: %d (Title: %s, AccessHash: %d)", id, ch.Title, ch.AccessHash)
+	}
 
-		_, err := sender.To(&tg.InputPeerChannel{ChannelID: pureID, AccessHash: randomID()}).Text(ctx, msg)
+	// ---------- Send to each notification group ----------
+	for _, channelID := range notificationGroups {
+		log.Printf("Processing notify target: %d", channelID)
+
+		// Get the channel entity with access hash from the entities map
+		channel, ok := notificationChannels[channelID]
+		if !ok {
+			log.Printf("Channel %d not found in entities, cannot send notification", channelID)
+
+			// Try alternative ID formats
+			// Bot API format: -100 prefix + channel ID
+			altChannelID := channelID
+			if channelID < -1000000000000 {
+				// Convert from bot API format to pure channel ID
+				altChannelID = -channelID - 1000000000000
+				log.Printf("  Trying alternative channel ID: %d", altChannelID)
+				channel, ok = notificationChannels[altChannelID]
+			} else if channelID > 0 {
+				// Try converting pure ID to bot API format
+				altChannelID = -1000000000000 - channelID
+				log.Printf("  Trying alternative channel ID: %d", altChannelID)
+				channel, ok = notificationChannels[altChannelID]
+			}
+
+			if !ok {
+				log.Printf("Channel not found in any ID format, skipping")
+				continue
+			}
+			log.Printf("Found channel using alternative ID: %d", altChannelID)
+		}
+
+		// Use the correct access hash from the channel entity
+		_, err := sender.To(&tg.InputPeerChannel{
+			ChannelID:  channel.ID,
+			AccessHash: channel.AccessHash,
+		}).Text(ctx, msg)
 		if err != nil {
-			log.Printf("Failed to send notification to %d: %v", pureID, err)
+			log.Printf("Failed to send notification to %d: %v", channelID, err)
 			return err
 		}
 
-		log.Printf("Notification sent to %d successfully", pureID)
+		log.Printf("Notification sent to %d successfully", channelID)
 	}
 
 	return nil
@@ -340,7 +360,8 @@ func run(ctx context.Context) error {
 				return nil
 			}
 
-			return sendLeaveNotification(ctx, sender, notificationGroups, user, channel, "left")
+			// Pass the entities.Channels map which contains access hashes
+			return sendLeaveNotification(ctx, sender, notificationGroups, e.Channels, user, channel, "left")
 
 		case *tg.MessageActionChatAddUser:
 			// User was added to the group
