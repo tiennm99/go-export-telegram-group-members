@@ -12,22 +12,10 @@ import (
 	"strings"
 	"time"
 
-	pebbledb "github.com/cockroachdb/pebble"
 	"github.com/go-faster/errors"
-	redisClient "github.com/go-redis/redis/v8"
-	boltstor "github.com/gotd/contrib/bbolt"
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
-	"github.com/gotd/contrib/pebble"
 	"github.com/gotd/contrib/storage"
-	"github.com/joho/godotenv"
-	"go.etcd.io/bbolt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"golang.org/x/time/rate"
-	lj "gopkg.in/natefinch/lumberjack.v2"
-
-	"github.com/gotd/contrib/redis"
 	"github.com/gotd/td/examples"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
@@ -36,6 +24,14 @@ import (
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/time/rate"
+	lj "gopkg.in/natefinch/lumberjack.v2"
+
+	"github.com/joho/godotenv"
+
+	"github.com/tiennm99/go-export-telegram-group-members/internal/couchbasestorage"
 )
 
 func sessionFolder(phone string) string {
@@ -46,16 +42,6 @@ func sessionFolder(phone string) string {
 		}
 	}
 	return "phone-" + string(out)
-}
-
-func RedisClient() *redisClient.Client {
-	url := os.Getenv("REDIS_URL")
-	opts, err := redisClient.ParseURL(url)
-	if err != nil {
-		panic(err)
-	}
-
-	return redisClient.NewClient(opts)
 }
 
 func sendLeaveNotification(ctx context.Context, sender *message.Sender, notificationGroups []int64, notificationChannels map[int64]*tg.Channel, user *tg.User, group interface{}, action string) error {
@@ -246,16 +232,17 @@ func run(ctx context.Context) error {
 	lg := zap.New(logCore)
 	defer func() { _ = lg.Sync() }()
 
-	redisClient := RedisClient()
-	sessionStorage := redis.NewSessionStorage(redisClient, "session:"+sessionFolder(phone))
+	storages, err := couchbasestorage.NewCouchbaseStorages()
+	if err != nil {
+		return errors.Wrap(err, "create couchbase storages")
+	}
+	defer storages.Cluster.Close(nil)
+
+	sessionStorage := couchbasestorage.NewCouchbaseSessionStorage(storages.Sessions, "session:"+sessionFolder(phone))
 
 	// Peer storage, for resolve caching and short updates handling.
-	db, err := pebbledb.Open(filepath.Join(sessionDir, "peers.pebble.db"), &pebbledb.Options{})
-	if err != nil {
-		return errors.Wrap(err, "create pebble storage")
-	}
-	peerDB := pebble.NewPeerStorage(db)
-	lg.Info("Storage", zap.String("path", sessionDir))
+	peerDB := couchbasestorage.NewCouchbasePeerStorage(storages.Peers)
+	lg.Info("Storage", zap.String("type", "couchbase"))
 
 	// Setting up client.
 	//
@@ -267,14 +254,10 @@ func run(ctx context.Context) error {
 
 	// Setting up persistent storage for qts/pts to be able to
 	// recover after restart.
-	boltdb, err := bbolt.Open(filepath.Join(sessionDir, "updates.bolt.db"), 0666, nil)
-	if err != nil {
-		return errors.Wrap(err, "create bolt storage")
-	}
 	updatesRecovery := updates.New(updates.Config{
-		Handler: updateHandler, // using previous handler with peerDB
+		Handler: updateHandler,
 		Logger:  lg.Named("updates.recovery"),
-		Storage: boltstor.NewStateStorage(boltdb),
+		Storage: couchbasestorage.NewCouchbaseStateStorage(storages.Updates),
 	})
 
 	// Handler of FLOOD_WAIT that will automatically retry request.
