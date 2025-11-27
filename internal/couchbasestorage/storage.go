@@ -41,9 +41,9 @@ func NewCouchbaseStorages() (*CouchbaseStorages, error) {
 		return nil, fmt.Errorf("connect to couchbase: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err = cluster.WaitUntilReady(ctx, 10*time.Second, gocb.WaitUntilReadyOptions{})
+	err = cluster.WaitUntilReady(10*time.Second, &gocb.WaitUntilReadyOptions{})
 	if err != nil {
 		cluster.Close(nil)
 		return nil, fmt.Errorf("wait ready: %w", err)
@@ -71,18 +71,19 @@ func NewCouchbaseSessionStorage(coll *gocb.Collection, key string) *CouchbaseSes
 
 func (s *CouchbaseSessionStorage) Load(ctx context.Context) (*session.Data, error) {
 	var data session.Data
-	_, err := s.coll.Get(s.key, &data)
+	result, err := s.coll.Get(s.key, &gocb.GetOptions{})
 	if err != nil {
-		if gocb.IsDocumentNotFoundError(err) {
-			return nil, session.ErrNotFound
-		}
-		return nil, fmt.Errorf("load session: %w", err)
+		return &data, session.ErrNotFound
+	}
+	err = result.Content(&data)
+	if err != nil {
+		return &data, session.ErrNotFound
 	}
 	return &data, nil
 }
 
 func (s *CouchbaseSessionStorage) Save(ctx context.Context, data *session.Data) error {
-	_, err := s.coll.Upsert(s.key, data)
+	_, err := s.coll.Upsert(s.key, data, &gocb.UpsertOptions{})
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
