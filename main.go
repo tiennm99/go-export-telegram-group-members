@@ -307,7 +307,7 @@ func run(ctx context.Context) error {
 	//   }
 
 	// Create a message sender that uses the resolver (handles access hash automatically)
-	sender := message.NewSender(api).WithResolver(resolver)
+	_ = message.NewSender(api).WithResolver(resolver)
 
 	// Registering handler for new private messages (to verify updates are working).
 	//dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
