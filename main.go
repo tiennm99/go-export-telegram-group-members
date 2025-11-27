@@ -450,12 +450,14 @@ func main() {
 	if err := run(ctx); err != nil {
 		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
 			fmt.Println("\rClosed")
-			os.Exit(0)
+			// os.Exit(0)
+			return
 		}
 		_, _ = fmt.Fprintf(os.Stderr, "Error: %+v\n", err)
 		os.Exit(1)
 	} else {
-		fmt.Println("Done")
-		os.Exit(0)
+		// fmt.Println("Done")
+		// os.Exit(0)
 	}
+	fmt.Println("Application shutdown complete")
 }
