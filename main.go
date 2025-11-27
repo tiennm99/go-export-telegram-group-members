@@ -346,8 +346,6 @@ func run(ctx context.Context) error {
 		switch action := serviceMsg.Action.(type) {
 		case *tg.MessageActionChatDeleteUser:
 			// User left or was removed
-			log.Printf("User %d left channel %d", action.UserID, channelID)
-
 			user, ok := e.Users[action.UserID]
 			if !ok {
 				log.Printf("User %d not found in entities", action.UserID)
@@ -360,8 +358,21 @@ func run(ctx context.Context) error {
 				return nil
 			}
 
+			// Format user display name with username
+			userDisplayName := user.FirstName
+			if user.LastName != "" {
+				userDisplayName += " " + user.LastName
+			}
+			if user.Username != "" {
+				userDisplayName += "(@" + user.Username + ")"
+			}
+
+			// Log the leave event
+			log.Printf("User %s, user display name (%s) leave %d, %s",
+				action.UserID, userDisplayName, channelID, channel.Title)
+
 			// Pass the entities.Channels map which contains access hashes
-			return sendLeaveNotification(ctx, sender, notificationGroups, e.Channels, user, channel, "left")
+			//return sendLeaveNotification(ctx, sender, notificationGroups, e.Channels, user, channel, "left")
 
 		case *tg.MessageActionChatAddUser:
 			// User was added to the group
