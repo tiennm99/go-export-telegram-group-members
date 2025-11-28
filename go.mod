@@ -1,4 +1,4 @@
-module github.com/tiennm99/go-export-telegram-group-members
+module github.com/tiennm99/monitor-telegram-group-members
 
 go 1.24.0
 
