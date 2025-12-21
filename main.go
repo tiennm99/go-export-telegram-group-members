@@ -2,462 +2,164 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
-	pebbledb "github.com/cockroachdb/pebble"
-	"github.com/go-faster/errors"
-	redisClient "github.com/go-redis/redis/v8"
-	boltstor "github.com/gotd/contrib/bbolt"
-	"github.com/gotd/contrib/middleware/floodwait"
-	"github.com/gotd/contrib/middleware/ratelimit"
-	"github.com/gotd/contrib/pebble"
-	"github.com/gotd/contrib/storage"
-	"github.com/joho/godotenv"
-	"go.etcd.io/bbolt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"golang.org/x/time/rate"
-	lj "gopkg.in/natefinch/lumberjack.v2"
-
-	"github.com/gotd/contrib/redis"
-	"github.com/gotd/td/examples"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/auth"
-	"github.com/gotd/td/telegram/message"
-	"github.com/gotd/td/telegram/message/peer"
-	"github.com/gotd/td/telegram/query"
-	"github.com/gotd/td/telegram/updates"
+	"github.com/celestix/gotgproto"
+	"github.com/celestix/gotgproto/ext"
+	"github.com/celestix/gotgproto/sessionMaker"
 	"github.com/gotd/td/tg"
+	"github.com/joho/godotenv"
+	"gorm.io/driver/sqlite"
 )
 
-func sessionFolder(phone string) string {
-	var out []rune
-	for _, r := range phone {
-		if r >= '0' && r <= '9' {
-			out = append(out, r)
-		}
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file not found")
 	}
-	return "phone-" + string(out)
-}
-
-func RedisClient() *redisClient.Client {
-	url := os.Getenv("REDIS_URL")
-	opts, err := redisClient.ParseURL(url)
+	phoneNumber, isExist := os.LookupEnv("TG_PHONE")
+	if !isExist {
+		log.Fatal("TG_PHONE not set")
+	}
+	rawAppId, isExist := os.LookupEnv("APP_ID")
+	if !isExist {
+		log.Fatal("APP_ID not set!")
+		return
+	}
+	appId, err := strconv.Atoi(rawAppId)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
+		return
 	}
-
-	return redisClient.NewClient(opts)
-}
-
-func sendLeaveNotification(ctx context.Context, sender *message.Sender, notificationGroups []int64, notificationChannels map[int64]*tg.Channel, user *tg.User, group interface{}, action string) error {
-
-	// ---------- Format user ----------
-	var userName string
-	if user != nil {
-		userName = user.FirstName
-		if user.LastName != "" {
-			userName += " " + user.LastName
-		}
-		if user.Username != "" {
-			userName += " (@" + user.Username + ")"
-		}
-	} else {
-		userName = "Unknown User"
+	appHash, isExist := os.LookupEnv("APP_HASH")
+	if !isExist {
+		log.Fatal("APP_HASH not set")
+		return
 	}
-
-	// ---------- Format group ----------
-	var groupName string
-	switch g := group.(type) {
-	case *tg.Channel:
-		groupName = g.Title
-	case *tg.Chat:
-		groupName = g.Title
-	default:
-		groupName = "Unknown Group"
+	rawGroupIds, isExist := os.LookupEnv("GROUP_IDS")
+	if !isExist {
+		log.Fatal("GROUP_IDS not set")
+		return
 	}
-
-	// Format timestamp
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-
-	msg := fmt.Sprintf("🚪 User %s %s from group \"%s\"\n⏰ Time: %s", userName, action, groupName, timestamp)
-	log.Println("Attempting to send notification:", msg)
-
-	// Debug: Print all available channel IDs in entities
-	log.Printf("DEBUG: Available channels in entities map:")
-	for id, ch := range notificationChannels {
-		log.Printf("  Channel ID: %d (Title: %s, AccessHash: %d)", id, ch.Title, ch.AccessHash)
-	}
-
-	// ---------- Send to each notification group ----------
-	for _, channelID := range notificationGroups {
-		log.Printf("Processing notify target: %d", channelID)
-
-		// Get the channel entity with access hash from the entities map
-		channel, ok := notificationChannels[channelID]
-		if !ok {
-			log.Printf("Channel %d not found in entities, cannot send notification", channelID)
-
-			// Try alternative ID formats
-			// Bot API format: -100 prefix + channel ID
-			altChannelID := channelID
-			if channelID < -1000000000000 {
-				// Convert from bot API format to pure channel ID
-				altChannelID = -channelID - 1000000000000
-				log.Printf("  Trying alternative channel ID: %d", altChannelID)
-				channel, ok = notificationChannels[altChannelID]
-			} else if channelID > 0 {
-				// Try converting pure ID to bot API format
-				altChannelID = -1000000000000 - channelID
-				log.Printf("  Trying alternative channel ID: %d", altChannelID)
-				channel, ok = notificationChannels[altChannelID]
-			}
-
-			if !ok {
-				log.Printf("Channel not found in any ID format, skipping")
-				continue
-			}
-			log.Printf("Found channel using alternative ID: %d", altChannelID)
-		}
-
-		// Use the correct access hash from the channel entity
-		_, err := sender.To(&tg.InputPeerChannel{
-			ChannelID:  channel.ID,
-			AccessHash: channel.AccessHash,
-		}).Text(ctx, msg)
-		if err != nil {
-			log.Printf("Failed to send notification to %d: %v", channelID, err)
-			return err
-		}
-
-		log.Printf("Notification sent to %d successfully", channelID)
-	}
-
-	return nil
-}
-
-func run(ctx context.Context) error {
-	var arg struct {
-		FillPeerStorage bool
-	}
-	flag.BoolVar(&arg.FillPeerStorage, "fill-peer-storage", false, "fill peer storage")
-	flag.Parse()
-
-	// Using ".env" file to load environment variables.
-	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
-		return errors.Wrap(err, "load env")
-	}
-
-	// TG_PHONE is phone number in international format.
-	// Like +4123456789.
-	phone := os.Getenv("TG_PHONE")
-	if phone == "" {
-		return errors.New("no phone")
-	}
-	// APP_HASH, APP_ID is from https://my.telegram.org/.
-	appID, err := strconv.Atoi(os.Getenv("APP_ID"))
+	groupIds, err := strToInts(rawGroupIds)
 	if err != nil {
-		return errors.Wrap(err, " parse app id")
-	}
-	appHash := os.Getenv("APP_HASH")
-	if appHash == "" {
-		return errors.New("no app hash")
+		log.Fatal(err)
+		return
 	}
 
-	// Load monitoring configuration
-	monitorGroupsStr := os.Getenv("MONITOR_GROUPS")
-	notificationGroupsStr := os.Getenv("NOTIFICATION_GROUPS")
-
-	if monitorGroupsStr == "" {
-		return errors.New("MONITOR_GROUPS not set")
-	}
-	if notificationGroupsStr == "" {
-		return errors.New("NOTIFICATION_GROUPS not set")
-	}
-
-	// Parse monitored groups
-	monitorGroups := make(map[int64]bool)
-	for _, idStr := range strings.Split(monitorGroupsStr, ",") {
-		idStr = strings.TrimSpace(idStr)
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
-			return errors.Wrap(err, "parse monitor group id: "+idStr)
-		}
-		monitorGroups[id] = true
-	}
-
-	// Parse notification groups
-	var notificationGroups []int64
-	for _, idStr := range strings.Split(notificationGroupsStr, ",") {
-		idStr = strings.TrimSpace(idStr)
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
-			return errors.Wrap(err, "parse notification group id: "+idStr)
-		}
-		notificationGroups = append(notificationGroups, id)
-	}
-
-	// Debug: Show parsed groups
-	log.Printf("Raw MONITOR_GROUPS: '%s'\n", monitorGroupsStr)
-	log.Printf("Raw NOTIFICATION_GROUPS: '%s'\n", notificationGroupsStr)
-
-	log.Printf("Monitoring %d groups: ", len(monitorGroups))
-	for id := range monitorGroups {
-		log.Printf("%d ", id)
-	}
-	log.Printf("\nWill notify %d groups: ", len(notificationGroups))
-	for _, id := range notificationGroups {
-		log.Printf("%d ", id)
-	}
-	log.Println()
-
-	// Setting up session storage.
-	// This is needed to reuse session and not login every time.
-	sessionDir := filepath.Join("session", sessionFolder(phone))
-	if err := os.MkdirAll(sessionDir, 0700); err != nil {
-		return err
-	}
-	logFilePath := filepath.Join(sessionDir, "log.jsonl")
-
-	fmt.Printf("Storing session in %s, logs in %s\n", sessionDir, logFilePath)
-
-	// Setting up logging to file with rotation.
-	//
-	// Log to file, so we don't interfere with prompts and messages to user.
-	logWriter := zapcore.AddSync(&lj.Logger{
-		Filename:   logFilePath,
-		MaxBackups: 3,
-		MaxSize:    1, // megabytes
-		MaxAge:     7, // days
-	})
-	logCore := zapcore.NewCore(
-		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
-		logWriter,
-		zap.DebugLevel,
-	)
-	lg := zap.New(logCore)
-	defer func() { _ = lg.Sync() }()
-
-	redisClient := RedisClient()
-	sessionStorage := redis.NewSessionStorage(redisClient, "session:"+sessionFolder(phone))
-
-	// Peer storage, for resolve caching and short updates handling.
-	db, err := pebbledb.Open(filepath.Join(sessionDir, "peers.pebble.db"), &pebbledb.Options{})
-	if err != nil {
-		return errors.Wrap(err, "create pebble storage")
-	}
-	peerDB := pebble.NewPeerStorage(db)
-	lg.Info("Storage", zap.String("path", sessionDir))
-
-	// Setting up client.
-	//
-	// Dispatcher is used to register handlers for events.
-	dispatcher := tg.NewUpdateDispatcher()
-	// Setting up update handler that will fill peer storage before
-	// calling dispatcher handlers.
-	updateHandler := storage.UpdateHook(dispatcher, peerDB)
-
-	// Setting up persistent storage for qts/pts to be able to
-	// recover after restart.
-	boltdb, err := bbolt.Open(filepath.Join(sessionDir, "updates.bolt.db"), 0666, nil)
-	if err != nil {
-		return errors.Wrap(err, "create bolt storage")
-	}
-	updatesRecovery := updates.New(updates.Config{
-		Handler: updateHandler, // using previous handler with peerDB
-		Logger:  lg.Named("updates.recovery"),
-		Storage: boltstor.NewStateStorage(boltdb),
-	})
-
-	// Handler of FLOOD_WAIT that will automatically retry request.
-	waiter := floodwait.NewWaiter().WithCallback(func(ctx context.Context, wait floodwait.FloodWait) {
-		// Notifying about flood wait.
-		lg.Warn("Flood wait", zap.Duration("wait", wait.Duration))
-		fmt.Println("Got FLOOD_WAIT. Will retry after", wait.Duration)
-	})
-
-	// Filling client options.
-	options := telegram.Options{
-		Logger:         lg,              // Passing logger for observability.
-		SessionStorage: sessionStorage,  // Setting up session sessionStorage to store auth data.
-		UpdateHandler:  updatesRecovery, // Setting up handler for updates from server.
-		Middlewares: []telegram.Middleware{
-			// Setting up FLOOD_WAIT handler to automatically wait and retry request.
-			waiter,
-			// Setting up general rate limits to less likely get flood wait errors.
-			ratelimit.New(rate.Every(time.Millisecond*100), 5),
+	client, err := gotgproto.NewClient(
+		// Get AppID from https://my.telegram.org/apps
+		appId,
+		// Get ApiHash from https://my.telegram.org/apps
+		appHash,
+		// ClientType, as we defined above
+		gotgproto.ClientTypePhone(phoneNumber),
+		// Optional parameters of client
+		&gotgproto.ClientOpts{
+			Session: sessionMaker.SqlSession(sqlite.Open("session.sqlite3")),
 		},
+	)
+	if err != nil {
+		log.Fatalln("failed to start client:", err)
 	}
-	client := telegram.NewClient(appID, appHash, options)
+
+	fmt.Printf("client (@%s) has been started...\n", client.Self.Username)
+
+	ctx := client.CreateContext()
 	api := client.API()
 
-	// Setting up resolver cache that will use peer storage.
-	resolver := storage.NewResolverCache(peer.Plain(api), peerDB)
-	// Usage:
-	//   if _, err := resolver.ResolveDomain(ctx, "tdlibchat"); err != nil {
-	//	   return errors.Wrap(err, "resolve")
-	//   }
+	// Example: work with the first group ID
+	groupID := groupIds[0]
 
-	// Create a message sender that uses the resolver (handles access hash automatically)
-	_ = message.NewSender(api).WithResolver(resolver)
+	inputPeer, err := ctx.ResolveInputPeerById(groupID)
+	if err != nil {
+		log.Fatalf("failed to resolve input peer: %v", err)
+	}
 
-	// Registering handler for new private messages (to verify updates are working).
-	//dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
-	//	msg, ok := u.Message.(*tg.Message)
-	//	if !ok {
-	//		return nil
-	//	}
-	//	log.Printf("DEBUG: Received message update from PeerID: %v", msg.GetPeerID())
-	//	return nil
-	//})
+	p := inputPeer.(*tg.InputPeerChannel)
 
-	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
-		// Check if this is a service message
-		serviceMsg, ok := u.Message.(*tg.MessageService)
-		if !ok {
-			// Regular message, not a service message
-			return nil
+	chat, err := ctx.GetChat(groupID)
+	if err != nil {
+		log.Fatalf("failed to get chat: %v", err)
+	}
+
+	// Prepare input channel
+	inputChannel := &tg.InputChannel{
+		ChannelID:  chat.GetID(),
+		AccessHash: p.AccessHash,
+	}
+
+	// Collect unique user IDs
+	users := make(map[int64]struct{})
+
+	offset := 0
+	limit := 100
+	totalCount := 200
+
+	for offset < totalCount {
+		resp, err := api.ChannelsGetParticipants(context.Background(), &tg.ChannelsGetParticipantsRequest{
+			Channel: inputChannel,
+			Filter:  &tg.ChannelParticipantsRecent{},
+			Offset:  offset,
+			Limit:   limit,
+			Hash:    0,
+		})
+		if err != nil {
+			log.Fatalf("failed to get participants: %v", err)
 		}
 
-		// Get channel ID from peer
-		var channelID int64
-		switch peer := serviceMsg.PeerID.(type) {
-		case *tg.PeerChannel:
-			channelID = peer.ChannelID
-		default:
-			return nil
+		data := resp.(*tg.ChannelsChannelParticipants)
+		totalCount = data.Count
+
+		for _, p := range data.Participants {
+			switch participant := p.(type) {
+			case *tg.ChannelParticipantSelf:
+				users[participant.UserID] = struct{}{}
+			case *tg.ChannelParticipant:
+				users[participant.UserID] = struct{}{}
+			case *tg.ChannelParticipantAdmin:
+				users[participant.UserID] = struct{}{}
+			case *tg.ChannelParticipantCreator:
+				users[participant.UserID] = struct{}{}
+			}
 		}
 
-		// Check if we're monitoring this group
-		fullChannelID := -1000000000000 - channelID
-		if !monitorGroups[channelID] && !monitorGroups[fullChannelID] {
-			return nil
-		}
+		offset += limit
+		log.Printf("Fetched %d / %d participants\n", offset, totalCount)
+	}
 
-		// Check the action type
-		switch action := serviceMsg.Action.(type) {
-		case *tg.MessageActionChatDeleteUser:
-			// User left or was removed
-			user, ok := e.Users[action.UserID]
-			if !ok {
-				log.Printf("User %d not found in entities", action.UserID)
-				return nil
-			}
+	log.Printf("Total unique participants: %d\n", len(users))
 
-			channel, ok := e.Channels[channelID]
-			if !ok {
-				log.Printf("Channel %d not found in entities", channelID)
-				return nil
-			}
+	// Optional: convert map to slice
+	userIDs := make([]int64, 0, len(users))
+	for id := range users {
+		userIDs = append(userIDs, id)
+	}
 
-			// Format user display name with username
-			userDisplayName := user.FirstName
-			if user.LastName != "" {
-				userDisplayName += " " + user.LastName
-			}
-			if user.Username != "" {
-				userDisplayName += "(@" + user.Username + ")"
-			}
-
-			// Log the leave event
-			log.Printf("User %s, user display name (%s) leave %d, %s",
-				action.UserID, userDisplayName, channelID, channel.Title)
-
-			// Pass the entities.Channels map which contains access hashes
-			//return sendLeaveNotification(ctx, sender, notificationGroups, e.Channels, user, channel, "left")
-
-		case *tg.MessageActionChatAddUser:
-			// User was added to the group
-			log.Printf("User(s) added to channel %d: %v", channelID, action.Users)
-			// Handle if needed
-
-		default:
-			// Other service actions (pinned message, changed photo, etc.)
-			log.Printf("Other service action: %T", action)
-			log.Printf("Details: %+v", action)
-		}
-
-		return nil
-	})
-
-	// Authentication flow handles authentication process, like prompting for code and 2FA password.
-	flow := auth.NewFlow(examples.Terminal{PhoneNumber: phone}, auth.SendCodeOptions{})
-
-	return waiter.Run(ctx, func(ctx context.Context) error {
-		// Spawning main goroutine.
-		if err := client.Run(ctx, func(ctx context.Context) error {
-			// Perform auth if no session is available.
-			if err := client.Auth().IfNecessary(ctx, flow); err != nil {
-				return errors.Wrap(err, "auth")
-			}
-
-			// Getting info about current user.
-			self, err := client.Self(ctx)
-			if err != nil {
-				return errors.Wrap(err, "call self")
-			}
-
-			name := self.FirstName
-			if self.Username != "" {
-				// Username is optional.
-				name = fmt.Sprintf("%s (@%s)", name, self.Username)
-			}
-			fmt.Println("Current user:", name)
-
-			lg.Info("Login",
-				zap.String("first_name", self.FirstName),
-				zap.String("last_name", self.LastName),
-				zap.String("username", self.Username),
-				zap.Int64("id", self.ID),
-			)
-
-			if arg.FillPeerStorage {
-				fmt.Println("Filling peer storage from dialogs to cache entities")
-				collector := storage.CollectPeers(peerDB)
-				if err := collector.Dialogs(ctx, query.GetDialogs(api).Iter()); err != nil {
-					return errors.Wrap(err, "collect peers")
-				}
-				fmt.Println("Filled")
-			}
-
-			// Waiting until context is done.
-			fmt.Println("Listening for updates. Interrupt (Ctrl+C) to stop.")
-			return updatesRecovery.Run(ctx, api, self.ID, updates.AuthOptions{
-				IsBot: self.Bot,
-				OnStart: func(ctx context.Context) {
-					fmt.Println("Update recovery initialized and started, listening for events")
-				},
-			})
-		}); err != nil {
-			return errors.Wrap(err, "run")
-		}
-		return nil
-	})
+	log.Println("Done.")
+	client.Idle()
 }
 
-func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
+func echo(ctx *ext.Context, update *ext.Update) error {
+	msg := update.EffectiveMessage
+	_, err := ctx.Reply(update, ext.ReplyTextString(msg.Text), nil)
+	return err
+}
 
-	if err := run(ctx); err != nil {
-		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
-			fmt.Println("\rClosed")
-			// os.Exit(0)
-			return
+func strToInts(s string) ([]int64, error) {
+	parts := strings.Split(s, ",")
+	ints := make([]int64, 0, len(parts))
+
+	for _, p := range parts {
+		v, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil {
+			return nil, err
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "Error: %+v\n", err)
-		os.Exit(1)
-	} else {
-		// fmt.Println("Done")
-		// os.Exit(0)
+		ints = append(ints, v)
 	}
-	fmt.Println("Application shutdown complete")
+
+	return ints, nil
 }
